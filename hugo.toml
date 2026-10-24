@@ -45,8 +45,6 @@ pagination.pagerSize = 12
   [params.homeInfoParams]
     Title = '把复杂的东西讲清楚'
     Content = '''
-9 年金融行业后端开发，长期做银行与消费金融的渠道类系统。
-
 这里不写「面试八股速记」，只做三件事：把机制拆到源码那一层、把线上问题的排查路径写完整、把踩过的坑记下来。
 '''
     AlignSocialIconsTo = 'left'
