@@ -1,0 +1,119 @@
+# 站点基础配置
+baseURL = 'https://zlliang-zz.github.io/'
+locale = 'zh-cn'
+defaultContentLanguage = 'zh'
+title = 'ZLLiang 的技术笔记'
+theme = 'PaperMod'
+
+enableRobotsTXT = true
+enableEmoji = true
+hasCJKLanguage = true
+buildFuture = false
+pagination.pagerSize = 12
+
+# 首页额外输出 JSON，供站内搜索使用
+[outputs]
+  home = ['HTML', 'RSS', 'JSON']
+  section = ['HTML', 'RSS']
+
+[params]
+  env = 'production'
+  description = 'Java 运行时、并发、数据库与分布式中间件的原理拆解与线上问题复盘'
+  author = 'ZLLiang'
+
+  # 视觉：默认浅色、可切换
+  defaultTheme = 'light'
+  disableThemeToggle = false
+  ShowReadingTime = true
+  ShowWordCount = true
+  ShowShareButtons = false
+  ShowCodeCopyButtons = true
+  ShowBreadCrumbs = true
+  ShowPostNavLinks = true
+  ShowRssButtonInSectionTermList = true
+  ShowToc = true
+  TocOpen = false
+  DateFormat = '2006-01-02'
+  # 首篇文章不特殊放大
+  disableSpecial1stPost = true
+  # 中文摘要按字符截断
+  summaryLength = 0
+
+  [params.assets]
+    favicon = '/favicon.svg'
+
+  [params.homeInfoParams]
+    Title = '把复杂的东西讲清楚'
+    Content = '''
+9 年金融行业后端开发，长期做银行与消费金融的渠道类系统。
+
+这里不写「面试八股速记」，只做三件事：把机制拆到源码那一层、把线上问题的排查路径写完整、把踩过的坑记下来。
+'''
+    AlignSocialIconsTo = 'left'
+
+  [[params.socialIcons]]
+    name = 'github'
+    url = 'https://github.com/ZLLiang-zz'
+  [[params.socialIcons]]
+    name = 'rss'
+    url = '/index.xml'
+
+  [params.fuseOpts]
+    isCaseSensitive = false
+    shouldSort = true
+    location = 0
+    distance = 1000
+    threshold = 0.4
+    minMatchCharLength = 1
+    limit = 20
+    keys = ['title', 'permalink', 'summary', 'content']
+
+[menu]
+  [[menu.main]]
+    identifier = 'posts'
+    name = '文章'
+    url = '/posts/'
+    weight = 10
+  [[menu.main]]
+    identifier = 'categories'
+    name = '分类'
+    url = '/categories/'
+    weight = 20
+  [[menu.main]]
+    identifier = 'tags'
+    name = '标签'
+    url = '/tags/'
+    weight = 30
+  [[menu.main]]
+    identifier = 'archives'
+    name = '归档'
+    url = '/archives/'
+    weight = 40
+  [[menu.main]]
+    identifier = 'search'
+    name = '搜索'
+    url = '/search/'
+    weight = 50
+  [[menu.main]]
+    identifier = 'about'
+    name = '关于'
+    url = '/about/'
+    weight = 60
+
+[markup]
+  [markup.goldmark.renderer]
+    unsafe = true
+  [markup.highlight]
+    noClasses = false
+    lineNos = false
+    codeFences = true
+    guessSyntax = true
+    tabWidth = 4
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+    ordered = false
+  [markup.goldmark.parser]
+    [markup.goldmark.parser.attribute]
+      block = true
+      title = true

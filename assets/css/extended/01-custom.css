@@ -1,0 +1,193 @@
+/* ===== ZLLiang 技术博客 · 浅色极简定制 ===== */
+
+:root {
+  --nav-width: 960px;
+  --main-width: 820px;
+  --gap: 26px;
+  --radius: 10px;
+  --accent: #1a6ac4;
+  --accent-soft: rgba(26, 106, 196, 0.09);
+}
+
+.dark {
+  --accent: #74b9ff;
+  --accent-soft: rgba(116, 185, 255, 0.12);
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Source Han Sans SC", "Noto Sans CJK SC",
+    sans-serif;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 正文：中文行距与段距放宽，长文更好读 */
+.post-content {
+  font-size: 1.01rem;
+  line-height: 1.88;
+  letter-spacing: 0.008em;
+}
+
+.post-content p {
+  margin: 1.05em 0;
+}
+
+.post-content h2 {
+  margin-top: 2.5em;
+  margin-bottom: 0.85em;
+  padding-bottom: 0.32em;
+  border-bottom: 1px solid var(--border);
+  font-size: 1.45rem;
+  letter-spacing: -0.01em;
+}
+
+.post-content h3 {
+  margin-top: 1.9em;
+  margin-bottom: 0.6em;
+  font-size: 1.16rem;
+}
+
+.post-content h4 {
+  margin-top: 1.5em;
+  font-size: 1.03rem;
+}
+
+.post-content a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease;
+}
+
+.post-content a:hover {
+  border-bottom-color: var(--accent);
+}
+
+/* 引用块：用于「一句话结论」这类提示 */
+.post-content blockquote {
+  margin: 1.4em 0;
+  padding: 0.85em 1.1em;
+  border-inline-start: 3px solid var(--accent);
+  background: var(--accent-soft);
+  border-radius: 0 6px 6px 0;
+  color: var(--content);
+}
+
+.post-content blockquote p {
+  margin: 0.35em 0;
+}
+
+/* 行内代码 */
+.post-content code {
+  font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", Consolas,
+    "Courier New", monospace;
+  font-size: 0.88em;
+  padding: 0.12em 0.36em;
+  border-radius: 4px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+}
+
+/* 代码块 */
+.post-content pre {
+  border-radius: var(--radius);
+  line-height: 1.62;
+}
+
+.post-content pre code {
+  font-size: 0.86em;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+/* 表格：技术文档里表格密度高，压缩内边距 */
+.post-content table {
+  font-size: 0.92rem;
+  line-height: 1.65;
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.4em 0;
+}
+
+.post-content th {
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.post-content th,
+.post-content td {
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+}
+
+.post-content tr:hover td {
+  background: rgba(0, 0, 0, 0.015);
+}
+
+/* 窄屏：宽表格横向滚动，避免撑破版心 */
+@media (max-width: 768px) {
+  .post-content table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+.dark .post-content tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.post-content ul,
+.post-content ol {
+  padding-inline-start: 1.35em;
+}
+
+.post-content li {
+  margin: 0.35em 0;
+}
+
+/* 列表页标题 */
+.post-title {
+  font-size: 1.85rem;
+  line-height: 1.35;
+  letter-spacing: -0.02em;
+}
+
+.post-meta {
+  font-size: 0.86rem;
+  opacity: 0.85;
+}
+
+/* 首页简介卡片 */
+.home-info .entry-content {
+  line-height: 1.85;
+}
+
+/* 文章卡片 */
+.post-entry {
+  border-radius: var(--radius);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.post-entry:hover {
+  transform: translateY(-1px);
+}
+
+.entry-title {
+  font-size: 1.2rem;
+  letter-spacing: -0.01em;
+}
+
+.entry-content {
+  font-size: 0.94rem;
+  line-height: 1.75;
+}
+
+/* 页脚更轻 */
+.footer {
+  font-size: 0.82rem;
+  opacity: 0.75;
+}
