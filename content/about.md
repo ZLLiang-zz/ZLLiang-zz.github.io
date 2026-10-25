@@ -10,8 +10,6 @@ ShowBreadCrumbs: false
 
 ## 关于我
 
-做过授信、用款、还款这类核心交易链路，也做过渠道接入中台、配置中心落地、库存与账务的并发控制。
-
 技术栈以 Java 为主：Spring 生态、MyBatis、MySQL / Oracle、Redis、RocketMQ、Dubbo / ZooKeeper，前端能独立完成管理后台页面。
 
 ## 关于这个博客
