@@ -1,9 +1,9 @@
 ---
 title: "Redis 全量深度解析：线程模型、数据结构、持久化、高可用与分布式工程"
-date: 2026-10-27T22:40:00+08:00
-summary: "一篇把 Redis 讲透的长文：为什么快（四层归因而非一句'内存+单线程'）、SDS/listpack/skiplist/dict 的底层实现、过期与淘汰、RDB/AOF 的 COW 与恢复陷阱、主从/哨兵/Cluster 的丢数据边界、缓存一致性、分布式锁的看门狗与 Redlock 争议、事务与 Lua、大 Key/热 Key、秒杀实战、事故复盘，以及 Java 客户端与序列化工程。每个结论带成立条件和代价。"
+date: 2026-11-09T23:00:00+08:00
+summary: "一篇把 Redis 讲透的长文：为什么快（四层归因而非一句'内存+单线程'）、SDS/listpack/skiplist/dict 的底层实现与源码结构、过期与淘汰、RDB/AOF 的 COW 与恢复陷阱、主从/哨兵/Cluster 的丢数据边界、缓存三大问题与一致性、分布式锁的看门狗与 Redlock 争议、事务与 Lua、限流/排行榜/队列的高级用法、大 Key/热 Key、秒杀实战、事故复盘，以及 Java 客户端与序列化工程。每个结论带成立条件和代价。"
 categories: ["Redis"]
-tags: ["Redis", "持久化", "高可用", "分布式锁", "缓存一致性", "skiplist", "listpack", "Redisson", "大Key"]
+tags: ["Redis", "持久化", "高可用", "分布式锁", "缓存一致性", "skiplist", "listpack", "Redisson", "大Key", "限流", "布隆过滤器"]
 author: ZLLiang
 ShowToc: true
 TocOpen: false
@@ -12,7 +12,7 @@ draft: false
 
 "Redis 为什么快"大概是后端开发里被讨论得最多、也答得最浅的一个问题。多数人会脱口而出"内存存储 + 单线程 + IO 多路复用"，把三件事并列成三条原因。但如果你再往下问一句"那为什么 `KEYS *` 一个命令就能把整个库卡住"，很多人就接不上了——因为这三件事解决的是**不同瓶颈**，而它们**都不解决单条命令的 O(N) 问题**。
 
-这篇文章把 Redis 从线程模型到底层数据结构、从持久化到高可用、从缓存一致性到分布式锁全量展开。默认以 6.x/7.x 为主线。每个结论都落到"为什么只能这么做"和"代价是什么"。
+这篇文章把 Redis 从线程模型到底层数据结构、从持久化到高可用、从缓存一致性到分布式锁全量展开，并把"为什么快""为什么用跳表""为什么要渐进式 rehash"这些问题的**源码级细节**一并补齐。默认以 6.x/7.x 为主线。每个结论都落到"为什么只能这么做"和"代价是什么"。
 
 ## 一、线程模型：为什么快，快在哪一层
 
@@ -25,13 +25,46 @@ Redis 为什么快，要按**四层归因**说清每一层解决什么：
 | 网络层 | epoll 多路复用 + 6.0 io-threads | 单线程管数万连接；io-threads 只并行读写与解析 |
 | 结构层 | SDS / listpack / skiplist / dict 按场景特化 | 同一语义多种编码，阈值由 `xxx-max-listpack-entries` 控制 |
 
-**"单线程"到底指什么**：Redis 6.x/7.x 实际有 6 类线程（主线程、io-threads、bio_close_file、bio_aof_fsync、bio_lazy_free、replica IO 线程），**只有"命令执行"是单线程**。AOF fsync 必须另开线程，因为 `fsync()` 是阻塞系统调用，放主线程会让所有命令卡住。
+关键在**分工**：内存解决 IO 延迟，单线程解决锁开销，多路复用解决连接数。而这三者**没有一个能解决单条命令的 O(N) 问题**——`KEYS *`、`HGETALL` 一个大 Hash，照样把整个实例卡住。这一句，是很多人对 Redis「快」的最大误判。
 
-**6.0 的 io-threads 为什么不能连命令执行一起并行**：瓶颈在网络不在计算——单核跑 10w QPS 时 `read/write` 系统调用与协议解析占 60%+ CPU，真正的命令执行占比很低。io 线程只负责"把字节读进缓冲区、解析成 argc/argv"，`processCommand()` 始终在主线程串行执行。三个不能并行命令的理由：① 数据结构不是线程安全的（dict 渐进式 rehash、listpack 原地扩容都没加锁）；② 语义会被破坏（INCR/SETNX 的原子性来自单线程串行）；③ 收益不对等（命令本身是纳秒级内存操作）。参数建议 `io-threads = CPU 核数 - 1 且 ≤ 8`，**4 核以下、QPS < 5w 不要开**。
+**"单线程"到底指什么**：Redis 6.x/7.x 实际有 6 类线程，**只有"命令执行"是单线程**：
+
+| 线程 | 职责 |
+| :--- | :--- |
+| 主线程 | 事件循环、命令解析与执行、回复写入 |
+| io-threads | 读请求解析、写回包（**不执行命令**，6.0 引入） |
+| bio_close_file / bio_aof_fsync / bio_lazy_free | 异步关文件、AOF 刷盘、惰性释放 |
+| replica IO 线程 | 主从复制的磁盘 IO |
+
+AOF fsync 必须另开线程，因为 `fsync()` 是阻塞系统调用，放主线程会让所有命令卡住。所以准确的说法是「**命令执行单线程**」——Redis 的原子性和无锁，是用「串行」换来的：主线程从头到尾执行完一条命令才处理下一条，中间不会被切走，`INCR`、`SETNX` 天然原子，所有数据结构都不用加锁。这条设计的直接推论是：**运维 Redis 的核心不是「加线程」，而是「消灭慢命令」**。
+
+**6.0 的 io-threads 为什么不能连命令执行一起并行**：瓶颈在网络不在计算——单核跑 10w QPS 时 `read/write` 系统调用与协议解析占 60%+ CPU（`perf top` 可见），真正的命令执行占比很低。io 线程只负责"把字节读进缓冲区、解析成 argc/argv"，`processCommand()` 始终在主线程串行执行。三个不能并行命令的理由，按重要性排：
+
+1. **数据结构不是线程安全的**——`dict` 的渐进式 rehash、`listpack` 的原地扩容都没加锁，并行执行等于重写内核；
+2. **语义会被破坏**——`INCR`/`SETNX`/`LPUSH` 的原子性来自串行，事务和 Lua 的「整体原子」也会被并行打破；
+3. **收益不对等**——命令执行是纳秒级内存操作，并行带来的锁开销可能比省下的时间还多。
+
+参数建议 `io-threads = CPU 核数 - 1 且 ≤ 8`，**4 核以下、QPS < 5w 不要开**——线程切换和同步的开销会吃掉收益。这是一个「加线程未必更快」的典型例子。
 
 **命令的原子性边界**：单命令原子是因为命令在事件循环里从头执行到尾不切走，但 `GET 后 SET`（读-改-写竞态）、多条命令组合（中间可插入别的客户端）、单命令 O(N)（阻塞所有人）都不原子。最典型的误用是"GET + 判断 + SET 实现分布式锁"，必须用 `SET key val NX PX 30000` 一条命令同时完成"不存在才设置"和"设置过期"。注意 Pipeline 只是合并 RTT，**不保证原子**。
 
+**事件循环的真实骨架**（`aeMain`）：单线程能处理并发连接，靠的是"就绪通知"不是"线程数"——epoll 返回的是就绪的 fd 列表，1 万连接里同一时刻可能只有几十个有数据：
+
+```c
+while (!stop) {
+    tvp = aeSearchNearestTimer(eventLoop);   /* 最近时间事件作为超时 */
+    numevents = aeApiPoll(eventLoop, tvp);   /* epoll_wait，阻塞等就绪 fd */
+    for (j = 0; j < numevents; j++) { ... }  /* 处理文件事件：读命令、写回包 */
+    if (timeEvent) processTimeEvents(eventLoop);  /* serverCron / 过期采样 */
+    beforeSleep(eventLoop);                  /* AOF 刷盘、快速过期循环 */
+}
+```
+
+`serverCron` 每 100ms 跑一次，负责过期键采样删除、渐进式 rehash、RDB 触发检查、主从心跳——这些「后台」工作全塞在这个循环的间隙里，这才能做到「一个线程包办一切」。
+
 ## 二、底层数据结构与编码
+
+在 Redis 里执行 `OBJECT ENCODING key`，你会看到一件反直觉的事：同一个逻辑类型，底层编码是**会变的**。这不是 bug，是 Redis 快的最隐蔽一根支柱——**数据结构按场景特化**：没有用一个「通用容器」走天下，而是给每个类型准备多套底层实现，在「省内存的小编码」和「高性能的完整结构」之间按数据形态切换。
 
 ### 2.1 编码切换表
 
@@ -47,21 +80,71 @@ Redis 为什么快，要按**四层归因**说清每一层解决什么：
 
 ### 2.2 SDS：二进制安全 + O(1) 长度 + 预分配
 
-SDS 不以 `\0` 判断结尾（C 字符串存不了图片/序列化字节流），`len` 字段让 strlen 从 O(N) 降到 O(1)，预分配 + 惰性释放减少 realloc。5 种类型 `sdshdr5/8/16/32/64` 按长度选最小元数据。
+Redis 没有用 C 语言的 `char*`，而是自己造了 `SDS`。结构体长这样：
 
-**embstr 44 字节的推导**（常被深挖的细节）：`jemalloc 64B 块 = redisObject(16B) + sdshdr8头(3B) + buf(44B) + '\0'(1B)`，正好一个内存块零碎片；超过 44B 落不进 64B 块就转 raw（两次分配）。
+```c
+struct __attribute__ ((__packed__)) sdshdr8 {
+    uint8_t len;    // 已用长度
+    uint8_t alloc;  // 分配总长度
+    unsigned char flags; // 低3位存类型
+    char buf[];     // 柔性数组
+};
+```
+
+三个直击 C 字符串痛点的理由：**二进制安全**（C 字符串以 `\0` 判断结尾，存不了图片/序列化字节流，SDS 用 `len` 记录长度）；**O(1) 取长度**（`strlen` 从 O(N) 降到 O(1)，`STRLEN` 命令依赖它）；**预分配 + 惰性释放**（扩容时小于 1MB 翻倍、超过 1MB 每次加 1MB，缩短时不立刻归还，减少 realloc 与内存抖动）。5 种类型 `sdshdr5/8/16/32/64` 按长度选最小元数据。
+
+**embstr 44 字节的推导**（常被深挖的细节）：`jemalloc 64B 块 = redisObject(16B) + sdshdr8头(3B) + buf(44B) + '\0'(1B)`，正好一个内存块零碎片；超过 44B 落不进 64B 块就转 raw（两次分配）。一句话理解：Redis 让 ≤44 字节的短字符串连同对象头一起塞进一个 64 字节内存块，一次分配、零碎片、正好卡在 CPU 缓存行上——本质是内存布局优化，不是语法差异。
 
 ### 2.3 listpack 如何从结构上消灭连锁更新
 
-ziplist entry 是 `<prevlen><encoding><data>`，`prevlen` 记录前一节点长度，前节点变大触发 `prevlen` 扩容，可能**级联更新后续所有节点（最坏 O(N²)）**。listpack entry 是 `<encoding><content><backlen>`，只记录**自身**长度，删除了 prevlen 前向依赖。
+ziplist entry 是 `<prevlen><encoding><data>`，`prevlen` 记录前一节点长度，前节点变大触发 `prevlen` 扩容，可能**级联更新后续所有节点（最坏 O(N²)）**。listpack entry 是 `<encoding><content><backlen>`，只记录**自身**长度，删除了 prevlen 前向依赖——「前节点变大导致后续级联更新」这件事在结构上就不可能发生了。
+
+而 `quicklist` 是另一层设计：它是一个双向链表，每个节点里再装一个 listpack（7.0 前是 ziplist）。节点内连续内存、节点间用链表串——既拿到连续内存的省内存和缓存友好，又避免整条链被一次连锁更新打穿。`fill` 控制每个节点的容量，`compress` 控制中间节点是否 LZF 压缩。
 
 ### 2.4 dict 的渐进式 rehash
 
-`dict` 有两个哈希表 `ht[0]/ht[1]` + `rehashidx`。渐进式 rehash 每次增删改查顺带迁移一个桶，配合 `serverCron` 定时批量迁移，**避免一次迁移百万 key 阻塞主线程**。rehash 期间**读查两表、写只进 ht[1]**。触发条件：负载因子 ≥1 扩容（BGSAVE 期间 ≥5 才扩，提高 COW 内存利用率），≤0.1 缩容。
+`dict` 有两个哈希表 `ht[0]/ht[1]` + `rehashidx`：
+
+```c
+typedef struct dict {
+    dictType *type;
+    void *privdata;
+    dictht ht[2];       // 两个哈希表
+    long rehashidx;     // -1 表示未在 rehash
+} dict;
+```
+
+哈希表扩容时，正常做法是旧表一次性搬进新表。但对 Redis 是灾难——一张表可能百万 key，一次搬完主线程卡住几百毫秒，期间**所有命令被阻塞**。所以 Redis 把「一次大搬迁」拆成「无数次小搬迁」：每次增删改查时**顺带迁移一个桶**，再由 `serverCron` 每 100ms 定时批量迁移一部分，把迁移摊到无数命令的间隙里。
+
+rehash 期间的一致性规则很简洁：**读查两表、写只进 ht[1]**。触发条件：负载因子 ≥1 扩容（BGSAVE 期间 ≥5 才扩，因为 fork 出的子进程靠 COW 共享内存，此时扩容制造更多写、更费内存），≤0.1 缩容。
+
+一个容易漏的细节：rehash 期间 `ht[0]` 和 `ht[1]` 同时存在，内存占用接近峰值，所以 **rehash 是 Redis 内存瞬时膨胀的一个隐蔽来源**——监控里看到内存突然多了一截、又慢慢回落，常常就是它。
 
 ### 2.5 skiplist 为什么不用红黑树
 
-三个理由：**范围查询**（ZRANGE）跳表按层顺序遍历天然高效；**span 跨度**用于 `ZRANK` 快速算排名，红黑树难以直接支持；实现/调试更简单。ZSet 用"跳表 + 哈希表双结构"：跳表负责排序范围查询，哈希表负责 `ZSCORE` O(1) 点查——空间换时间的典型组合。
+有序集合（ZSet）的完整编码是「跳表 + 哈希表」双结构。哈希表负责 `ZSCORE` 的 O(1) 点查，跳表负责排序和范围查询。跳表本质是「带多层索引的链表」，每个节点随机决定层数（每层晋升概率 25%），平均 O(logN)。节点结构：
+
+```c
+typedef struct zskiplistNode {
+    sds ele;
+    double score;
+    struct zskiplistNode *backward;
+    struct zskiplistLevel {
+        struct zskiplistNode *forward;
+        unsigned long span;   // 跨度
+    } level[];
+} zskiplistNode;
+```
+
+用跳表而不是红黑树，三个很实际的理由：
+
+1. **范围查询天然高效**——跳表按层顺序遍历，`ZRANGE` 取连续区间直接线性；红黑树要中序遍历还得维护栈；
+2. **实现和调试简单**——没有旋转、染色那套平衡操作；
+3. **`span` 支持按排名定位**——`ZRANK` 要回答「这个元素排第几」，跳表累加跨过的 span 就行；红黑树得额外维护子树大小。
+
+代价：跳表靠随机层数，理论上存在「层数运气差」的退化（概率极低），且比红黑树多占指针内存。但 Redis 要的核心是「范围查询 + 排名」，跳表明显更合适。
+
+一个延伸到内存「只涨不跌」的细节：Set 在「全整数且 ≤512 个」时用 intset，一旦混入一个字符串就整体升级成 hashtable，**且升级后不再降级**——字符串后来删掉了，内存也不会自动回落。
 
 ## 三、过期删除与内存淘汰
 
@@ -80,6 +163,8 @@ ziplist entry 是 `<prevlen><encoding><data>`，`prevlen` 记录前一节点长�
 RDB 用 `fork + COW`（写时复制）。**fork 复制的是页表，不是内存数据**：父子共享同一批物理页，页表项标记只读，写入时触发缺页中断复制该页。所以"COW 复制的量"取决于快照期间被修改的页数，不是实例总内存。
 
 三个真实代价：① **fork 阻塞**（复制页表，10GB 实例约 100~300ms，大实例 + 虚拟化可能秒级）；② **内存膨胀**（写入量大时接近 2 倍）；③ CPU 抖动。**THP（透明大页）必须关**：默认 4KB 页，THP 把页放大到 2MB，一次 COW 要复制 2MB，膨胀与卡顿都被放大数十倍——`echo never > /sys/kernel/mm/transparent_hugepage/enabled`。
+
+观测手段：`INFO stats` 的 `latest_fork_usec`（最近一次 fork 耗时）和 `total_forks`；`INFO memory` 里 `used_memory_rss` 与 `used_memory` 的差值反映 COW 实际占了多少内存。大实例（超 32GB）最省心的做法是主从 + 让从库做 RDB，从库 fork 不影响主库。
 
 ### 4.2 AOF 的三层缓冲
 
@@ -127,17 +212,66 @@ RDB 用 `fork + COW`（写时复制）。**fork 复制的是页表，不是内�
 
 ## 六、缓存三大问题与一致性
 
-穿透（查不存在数据直击 DB）→ 布隆过滤器 + 空值缓存；击穿（热点 key 过期并发重建）→ 互斥锁 + 逻辑过期 + 永不过期；雪崩（大量 key 同时过期/宕机）→ TTL 随机打散 + 高可用 + 限流降级。
+穿透、击穿、雪崩是三个**不同的病**，混着答是新手最常见的错误：
 
-**缓存一致性为什么是 Cache Aside（先更 DB 再删缓存）**：删缓存而非更新缓存（并发写时更新缓存存在乱序覆盖）；先 DB 后删而非先删后更（先删后更有"旧值回填"长窗口，先更后删窗口极小）。仍不彻底，两级兜底：**延迟双删** + **Binlog 订阅（Canal）异步删缓存**（以 DB 为唯一事实源）。一致性本质是**最终一致**，追求强一致就不该引入缓存。
+| 问题 | 现象 | 病根 | 解法 |
+| :--- | :--- | :--- | :--- |
+| **穿透** | 查不存在的数据，每次都打到 DB | 缓存和 DB 都没有，缓存形同虚设 | 布隆过滤器；缓存空值并设短 TTL |
+| **击穿** | 某个热点 key 过期，瞬间大量请求并发重建 | 热点 key 失效那一刻的并发 | 互斥锁重建；逻辑过期；永不过期 |
+| **雪崩** | 大量 key 同时过期，或 Redis 整体宕机 | 过期时间集中 / 单点失效 | TTL 随机打散；高可用；限流降级 |
+
+区分的关键在「查的是不是存在的 key」：穿透是查一个**根本不存在**的东西（如恶意遍历 UUID），击穿是查一个**存在但刚好过期**的热点。
+
+**穿透**用布隆过滤器或缓存空值。布隆过滤器的特性是「**存在可能误判、不存在一定不漏**」，能把绝大多数不存在的 key 挡在缓存之外。误判率由位数组大小、哈希函数个数、元素数共同决定，1% 误判率约需每元素 9.6 bit；它不支持删除（要用 Counting Bloom Filter 或布谷鸟过滤器）。缓存空值则是给「查不到」的结果也缓存一条、设短 TTL，代价是防被恶意 key 撑爆，需配上游参数校验。
+
+**击穿**的核心是「只让一个请求去重建」。经典写法是互斥锁 + 双重检查：
+
+```java
+public String getWithLock(String key) {
+    String value = redis.get(key);
+    if (value != null) return value;
+
+    String lockKey = "lock:" + key;
+    Boolean locked = redis.setIfAbsent(lockKey, "1", Duration.ofSeconds(10));
+    if (Boolean.TRUE.equals(locked)) {
+        try {
+            value = redis.get(key);   // 双重检查：可能已被前一个线程重建
+            if (value == null) {
+                value = loadFromDB(key);
+                redis.set(key, value, Duration.ofMinutes(30));
+            }
+            return value;
+        } finally {
+            redis.delete(lockKey);
+        }
+    } else {
+        Thread.sleep(50);
+        return getWithLock(key);   // 自旋等待或返回旧值
+    }
+}
+```
+
+对比方案「逻辑过期」：value 内嵌过期时间字段、物理 TTL 永不设置，发现逻辑过期后异步重建、当前请求直接返回旧值——**牺牲一致性换可用性**，适合热点且容忍短暂旧值的场景。
+
+**雪崩**最朴素的解法是 TTL 随机打散：基础 30 分钟，随机偏移 ±5 分钟。再往上就是高可用 + 限流降级兜底。
+
+**缓存一致性为什么是 Cache Aside（先更 DB 再删缓存）**：第一，「删缓存」而非「更新缓存」——并发写时更新缓存会乱序覆盖（后写的旧值覆盖先写的新值），删除是幂等且懒加载；第二，「先 DB 后删」而非「先删后更」——先删后更有"旧值回填"长窗口（删掉缓存后、DB 更新完成前，读请求把旧值重新加载进缓存，脏数据长期存在），先更后删窗口极小。仍不彻底，两级兜底：**延迟双删**（更新 DB + 删缓存后延迟几百毫秒再删一次）+ **Binlog 订阅（Canal）异步删缓存**（以 DB 为唯一事实源）。一致性本质是**最终一致**，追求强一致就不该引入缓存。
 
 ## 七、分布式锁：从 SET NX 到 Redlock 的取舍
 
-`SET NX PX` 三个经典缺陷：锁过期业务未完成、误删他人锁（校验 + 删除非原子，需 Lua）、主从切换锁丢失（客户端 A 在主节点加锁，主宕机锁未同步，新主上 B 再次加锁成功——双持锁）。
+分四层递进理解。
 
-**Redisson 看门狗**：默认锁过期 30s（`lockWatchdogTimeout`），续期任务**每 1/3 过期时间（10s）**检查持锁状态续期回 30s。为什么是 1/3 不是 1/2——留两次重试机会。**一旦显式传了 leaseTime，看门狗失效**（代码评审高频问题）。存储结构用 **Hash**（`{clientId:threadId : 重入次数}`）而非 String，天然支持可重入。
+**第一层 `SET key val NX PX 30000`**：一条命令同时完成"不存在才设置"和"设置过期"，比 `SETNX`+`EXPIRE` 两步安全（那两步中间宕机会留下永久锁）。但三个经典缺陷：
 
-**Redlock 的争议**：Martin Kleppmann 批评其依赖时钟同步、缺 fencing token；antirez 回应可用单调时钟近似。**工程结论：绝大多数业务单实例/哨兵 + Redisson + 业务幂等已足够**；强正确性（资金、库存超卖）应使用支持 fencing 的存储（ZooKeeper/etcd）或数据库乐观锁。**Redis 锁是"效率锁"不是"正确性锁"**——判断标准很简单：丢锁会不会导致钱算错？会，就别只靠 Redis 锁。
+1. **锁过期业务未完成**——30 秒到期业务跑 40 秒，第二个客户端进来，互斥失效；
+2. **误删他人锁**——A 锁过期、B 加锁成功、A 这时 `DEL` 把 B 的锁删了；必须校验"锁还是不是我的"再删，且校验 + 删除要 Lua 原子执行；
+3. **主从切换丢锁**——A 在主节点加锁，主宕机且锁未同步到从库，新主上 B 又加锁成功，**双持锁**。
+
+**第二层 Redisson 看门狗**：解决缺陷 1。默认锁过期 30s（`lockWatchdogTimeout`），续期任务**每 1/3 过期时间（10s）**检查持锁状态续期回 30s。为什么是 1/3 不是 1/2——留两次重试机会（某次续期网络抖动失败，还有下一个 10 秒窗口，三次都失败才真丢锁）。存储结构用 **Hash**（`lock:order:1001 → { "clientId:threadId" : 重入次数 }`）而非 String，天然支持可重入（同线程再加锁 `hincrby` +1，解锁 -1 到 0 才 `del`）。两个必须记住的坑：**一旦显式传了 leaseTime，看门狗失效**（代码评审高频问题）；`unlock()` 必须由加锁线程调用，否则抛 `IllegalMonitorStateException`。
+
+**第三层 Redlock 的争议**：缺陷 3 单实例和哨兵都治不了，Redlock 向 N 个（通常 5 个）完全独立节点请求加锁，超半数成功且总耗时小于锁过期时间才算成功。Martin Kleppmann 批评它依赖各节点时钟同步——进程 GC 停顿、时钟跳变会破坏锁语义，且缺少 fencing token（持锁者 GC 停顿醒来后，可能操作已被新持锁者接管的数据）；antirez 回应可用单调时钟近似。这场争论至今没有公认结论。
+
+**第四层最终判据**：Redis 锁解决「多个进程不要同时干活」（效率），不是「数据一定不会错」（正确性）。前者丢锁只是重复劳动，后者丢锁就是资损。判断标准一句话——**丢锁会不会导致钱算错**：会，就别只靠 Redis 锁，用 ZooKeeper/etcd 或数据库乐观锁；不会（如防重复点击），单实例/哨兵 + Redisson + 幂等足够。**Redis 锁是"效率锁"不是"正确性锁"**。
 
 ## 八、事务、Lua 与 Pipeline：原子性的三个层次
 
@@ -155,11 +289,34 @@ RDB 用 `fork + COW`（写时复制）。**fork 复制的是页表，不是内�
 
 ## 九、高级应用场景
 
-- **排行榜**：ZSet 跳表 O(logN) 插入与 span 排名；大规模只保留 Top N（`ZREMRANGEBYRANK` 裁剪）。
-- **限流**：固定窗口（简单，有临界突刺）→ 滑动窗口 ZSet（精确，内存与请求量线性）→ 令牌桶 Lua（平滑，支持突发，网关级首选）。
-- **消息队列**：List 简易队列无 ACK（消费失败即丢，慎用核心链路）；**Stream + 消费者组**有 ACK + 回溯，但无分级存储、堆积能力受内存限制，核心链路仍选专业 MQ。
+- **排行榜**：ZSet 跳表 O(logN) 插入与 span 排名；大规模只保留 Top N（`ZREMRANGEBYRANK` 裁剪）；分数相同加时间戳做次级维度。
+- **限流**：固定窗口（简单，有临界突刺——第 59 秒和第 61 秒各来 100 次，中间 2 秒突刺 200 次）→ 滑动窗口 ZSet（精确，内存与请求量线性）→ 令牌桶 Lua（平滑，支持突发，网关级首选）。
+- **消息队列**：List 简易队列无 ACK（消费失败即丢，慎用核心链路）；**Stream + 消费者组**有 ACK + 回溯，但无分级存储、堆积能力受内存限制、无事务消息和延迟消息，核心链路仍选专业 MQ。
 - **分布式 ID**：`INCR` 简单高性能，但依赖 Redis 可用性；进阶号段模式（一次 `INCRBY 1000` 本地分配）或 Snowflake。
 - **购物车**：Hash 天然适合（field=商品，value=数量）。
+
+**令牌桶的核心 Lua**（原子完成「补令牌 → 扣令牌」）：
+
+```lua
+-- KEYS[1] 桶key; ARGV[1] 容量; ARGV[2] 速率(个/秒); ARGV[3] 当前毫秒; ARGV[4] 请求令牌数
+local capacity = tonumber(ARGV[1])
+local rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
+local lastTime = redis.call('hget', KEYS[1], 'lastTime') or now
+local tokens = tonumber(redis.call('hget', KEYS[1], 'tokens') or capacity)
+local delta = math.max(0, now - lastTime)
+local newTokens = math.min(capacity, tokens + delta * rate / 1000)
+if newTokens >= requested then
+    redis.call('hset', KEYS[1], 'tokens', newTokens - requested)
+    redis.call('hset', KEYS[1], 'lastTime', now)
+    return 1
+else
+    return 0
+end
+```
+
+选型上，单机内用 Guava/Sentinel，分布式小规模用 Redis，大规模网关用独立限流服务，别把 Redis 当唯一限流闸口。
 
 ## 十、性能调优：大 Key 与热 Key 是两个问题
 
@@ -167,13 +324,13 @@ RDB 用 `fork + COW`（写时复制）。**fork 复制的是页表，不是内�
 
 **大 Key 的危害不是"慢"，是"连累所有人"**：`GET` 一个 10MB value 网络传输几十 ms，主线程期间不能处理其他命令；`DEL` 百万元素 Hash 是 O(N) 同步释放（**必须用 `UNLINK`**）；RDB/AOF 重写序列化大 key 拉长 COW 窗口；主从复制大 key 拉长从库 loading；Cluster 下大 key 导致分片倾斜。
 
-**热 Key 治理阶梯**（成本从低到高）：本地缓存（Caffeine 扛 90% 读，短 TTL 或广播失效）→ 读写分离（读打多从库）→ key 打散（`hotkey:{0..9}` 存 10 份副本，读随机选，写写 10 份）→ 限流降级。慢查询高频元凶：`KEYS *`（生产禁用，用 SCAN）、大集合 `HGETALL/SMEMBERS`、大偏移量 `ZRANGE`、过长 Lua。内存碎片看 `mem_fragmentation_ratio > 1.5`（碎片多），**< 1 说明用 swap，更严重**。
+**大 Key 探测**最稳妥的是离线分析 RDB 文件（`rdb_bigkeys` / `redis-rdb-tools`），而不是线上 `--bigkeys`——后者基于 `SCAN` 采样，每种类型只报最大的一个，还会漏。
+
+**热 Key 治理阶梯**（成本从低到高）：本地缓存（Caffeine 扛 90% 读，短 TTL 或广播失效）→ 读写分离（读打多从库）→ key 打散（`hotkey:{0..9}` 存 10 份副本，读随机选，写写 10 份）→ 限流降级。注意 `--hotkeys` 也不可靠（依赖 `OBJECT FREQ` 采样，LFU 未开启时无数据）。慢查询高频元凶：`KEYS *`（生产禁用，用 SCAN）、大集合 `HGETALL/SMEMBERS`、大偏移量 `ZRANGE`、过长 Lua。内存碎片看 `mem_fragmentation_ratio > 1.5`（碎片多），**< 1 说明用 swap，更严重**。
 
 ## 十一、源码级核心链路
 
 一条 `SET key value` 的旅程：客户端发 RESP → epoll 返回可读事件 → `readQueryFromClient`（6.0+ 解析可放 IO 线程）→ `processInputBuffer` 解析 argv → `lookupCommand` 从命令表 O(1) 找到 redisCommand → `call() → setCommand`（含 expire 判断）→ 传播 `feedAppendOnlyFile`（AOF）+ `replicationFeedSlaves`（主从）→ `addReply` 写输出缓冲 → `beforeSleep` 处理写回。**命令执行永远单线程，网络收发 6.0 起可并行**。
-
-事件循环 `aeMain`：计算最近时间事件到期时间作为 `epoll_wait` 超时 → 处理文件事件 → 处理时间事件（serverCron）→ beforeSleep。**单线程能处理并发连接，靠的是"就绪通知"不是"线程数"**——epoll 返回的是就绪的 fd 列表，1 万连接里同一时刻可能只有几十个有数据。
 
 ## 十二、客户端选型与连接治理
 
@@ -235,4 +392,4 @@ RESP3（6.0+）新增 map/set/boolean/push 等原生类型，**push 是革命性
 
 Redis 的核心价值是**内存存储 + 单线程事件驱动模型**：命令执行单线程换无锁与原子性，6.0 的多线程只并行 IO 不并行计算；底层用 SDS、quicklist、listpack、dict、skiplist、intset 做空间与时间的权衡；持久化用 RDB + AOF 混合；高可用按容量在"主从 + 哨兵"与"Cluster"间选型。
 
-三条边界记住：**Redis 主从切换是高可用不是不丢数据**；**Redis 锁是效率锁不是正确性锁**；**缓存一致性是最终一致，追求强一致就不该引入缓存**。调优三板斧：`maxmemory + allkeys-lru` 治容量，大 Key 拆分 + UNLINK 治阻塞，SCAN 替代 KEYS + 慢日志治性能毛刺。
+四条边界记住：**Redis 主从切换是高可用不是不丢数据**；**Redis 锁是效率锁不是正确性锁**；**缓存一致性是最终一致，追求强一致就不该引入缓存**；**Pipeline 不保证原子，Stream 替代不了专业 MQ**。调优三板斧：`maxmemory + allkeys-lru` 治容量，大 Key 拆分 + UNLINK 治阻塞，SCAN 替代 KEYS + 慢日志治性能毛刺。
